@@ -31,11 +31,413 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
-    quantization::Code,
+    quantization,
     spann::utils,
     usearch::{USearchIndex, USearchIndexConfig, USearchIndexProvider},
     IndexUuid, OpenMode, SearchResult, VectorIndex, VectorIndexProvider,
 };
+
+// =============================================================================
+// Statistics
+// =============================================================================
+
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// Statistics for a single method.
+    #[derive(Default)]
+    pub struct MethodStats {
+        pub calls: AtomicU64,
+        pub total_nanos: AtomicU64,
+    }
+
+    impl MethodStats {
+        #[inline]
+        pub fn record(&self, nanos: u64) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.total_nanos.fetch_add(nanos, Ordering::Relaxed);
+        }
+
+        pub fn get(&self) -> (u64, u64) {
+            (
+                self.calls.load(Ordering::Relaxed),
+                self.total_nanos.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    /// Snapshot of stats for a single method (non-atomic, owned).
+    #[derive(Clone, Copy, Default)]
+    pub struct MethodSnapshot {
+        pub calls: u64,
+        pub total_nanos: u64,
+    }
+
+    impl MethodSnapshot {
+        pub fn avg_nanos(&self) -> Option<u64> {
+            if self.calls > 0 {
+                Some(self.total_nanos / self.calls)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Statistics for cluster size distribution.
+    #[derive(Clone, Default)]
+    pub struct ClusterSizeStats {
+        pub num_centroids: u64,
+        pub min: u64,
+        pub max: u64,
+        pub median: u64,
+        pub p90: u64,
+        pub p99: u64,
+        pub avg: f64,
+        pub std: f64,
+    }
+
+    impl ClusterSizeStats {
+        /// Compute cluster size statistics from a slice of sizes.
+        pub fn from_sizes(sizes: &[usize]) -> Self {
+            if sizes.is_empty() {
+                return Self::default();
+            }
+
+            let mut sorted: Vec<usize> = sizes.to_vec();
+            sorted.sort_unstable();
+
+            let n = sorted.len();
+            let sum: usize = sorted.iter().sum();
+            let avg = sum as f64 / n as f64;
+
+            let variance = sorted
+                .iter()
+                .map(|&x| (x as f64 - avg).powi(2))
+                .sum::<f64>()
+                / n as f64;
+            let std = variance.sqrt();
+
+            let percentile = |p: f64| -> u64 {
+                let idx = ((n as f64 - 1.0) * p).round() as usize;
+                sorted[idx.min(n - 1)] as u64
+            };
+
+            Self {
+                num_centroids: n as u64,
+                min: sorted[0] as u64,
+                max: sorted[n - 1] as u64,
+                median: percentile(0.5),
+                p90: percentile(0.9),
+                p99: percentile(0.99),
+                avg,
+                std,
+            }
+        }
+    }
+
+    /// Snapshot of all method stats (non-atomic, owned).
+    #[derive(Clone, Default)]
+    pub struct StatsSnapshot {
+        pub add: MethodSnapshot,
+        pub navigate: MethodSnapshot,
+        pub register: MethodSnapshot,
+        pub spawn: MethodSnapshot,
+        pub scrub: MethodSnapshot,
+        pub split: MethodSnapshot,
+        pub merge: MethodSnapshot,
+        pub reassign: MethodSnapshot,
+        pub drop: MethodSnapshot,
+        pub load: MethodSnapshot,
+        pub load_raw: MethodSnapshot,
+        pub quantize: MethodSnapshot,
+        pub search: MethodSnapshot,
+        pub raw_add: MethodSnapshot,
+        pub raw_rm: MethodSnapshot,
+        pub q_add: MethodSnapshot,
+        pub q_rm: MethodSnapshot,
+        pub load_raw_points: u64,
+        pub cluster_stats: ClusterSizeStats,
+    }
+
+    impl StatsSnapshot {
+        pub fn get(&self, name: &str) -> MethodSnapshot {
+            match name {
+                "add" => self.add,
+                "navigate" => self.navigate,
+                "register" => self.register,
+                "spawn" => self.spawn,
+                "scrub" => self.scrub,
+                "split" => self.split,
+                "merge" => self.merge,
+                "reassign" => self.reassign,
+                "drop" => self.drop,
+                "load" => self.load,
+                "load_raw" => self.load_raw,
+                "quantize" => self.quantize,
+                "search" => self.search,
+                "raw_add" => self.raw_add,
+                "raw_rm" => self.raw_rm,
+                "q_add" => self.q_add,
+                "q_rm" => self.q_rm,
+                _ => MethodSnapshot::default(),
+            }
+        }
+    }
+
+    /// Aggregated statistics for all instrumented methods.
+    #[derive(Default)]
+    pub struct QuantizedSpannStats {
+        pub add: MethodStats,
+        pub navigate: MethodStats,
+        pub register: MethodStats,
+        pub spawn: MethodStats,
+        pub scrub: MethodStats,
+        pub split: MethodStats,
+        pub merge: MethodStats,
+        pub reassign: MethodStats,
+        pub drop: MethodStats,
+        pub load: MethodStats,
+        pub load_raw: MethodStats,
+        pub quantize: MethodStats,
+        pub search: MethodStats,
+        pub raw_add: MethodStats,
+        pub raw_rm: MethodStats,
+        pub q_add: MethodStats,
+        pub q_rm: MethodStats,
+        pub load_raw_points: AtomicU64,
+    }
+
+    impl QuantizedSpannStats {
+        pub fn snapshot(&self, cluster_sizes: &[usize]) -> StatsSnapshot {
+            let snap = |m: &MethodStats| {
+                let (calls, total_nanos) = m.get();
+                MethodSnapshot { calls, total_nanos }
+            };
+            StatsSnapshot {
+                add: snap(&self.add),
+                navigate: snap(&self.navigate),
+                register: snap(&self.register),
+                spawn: snap(&self.spawn),
+                scrub: snap(&self.scrub),
+                split: snap(&self.split),
+                merge: snap(&self.merge),
+                reassign: snap(&self.reassign),
+                drop: snap(&self.drop),
+                load: snap(&self.load),
+                load_raw: snap(&self.load_raw),
+                quantize: snap(&self.quantize),
+                search: snap(&self.search),
+                raw_add: snap(&self.raw_add),
+                raw_rm: snap(&self.raw_rm),
+                q_add: snap(&self.q_add),
+                q_rm: snap(&self.q_rm),
+                load_raw_points: self.load_raw_points.load(Ordering::Relaxed),
+                cluster_stats: ClusterSizeStats::from_sizes(cluster_sizes),
+            }
+        }
+    }
+
+    // All methods ordered by path: Write Path, Balance Path, I/O, Quantization
+    const ALL_METHODS: &[&str] = &[
+        "add", "navigate", "register", "spawn", // Write Path
+        "scrub", "split", "merge", "reassign", "drop", // Balance Path
+        "load", "load_raw", // I/O
+        "quantize", // Quantization (encoding vectors to codes)
+        "search",   // Search (centroid navigate + cluster scan)
+        "raw_add", "raw_rm", "q_add", "q_rm", // HNSW centroid index ops
+    ];
+
+    fn format_duration(nanos: u64) -> String {
+        if nanos < 1_000 {
+            format!("{}ns", nanos)
+        } else if nanos < 1_000_000 {
+            format!("{:.1}µs", nanos as f64 / 1_000.0)
+        } else if nanos < 1_000_000_000 {
+            format!("{:.2}ms", nanos as f64 / 1_000_000.0)
+        } else {
+            format!("{:.2}s", nanos as f64 / 1_000_000_000.0)
+        }
+    }
+
+    fn format_count(n: u64) -> String {
+        if n < 1_000 {
+            n.to_string()
+        } else if n < 1_000_000 {
+            format!("{:.1}K", n as f64 / 1_000.0)
+        } else {
+            format!("{:.2}M", n as f64 / 1_000_000.0)
+        }
+    }
+
+    fn format_cluster_stats_table(snapshots: &[StatsSnapshot]) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        writeln!(out, "\n=== Cluster Statistics ===").unwrap();
+        writeln!(
+            out,
+            "| CP | Centroids |   Min |   Max | Median |   P90 |   P99 |    Avg |    Std |"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "|----|-----------|-------|-------|--------|-------|-------|--------|--------|"
+        )
+        .unwrap();
+        for (i, snap) in snapshots.iter().enumerate() {
+            let cs = &snap.cluster_stats;
+            writeln!(
+                out,
+                "| {:>2} | {:>9} | {:>5} | {:>5} | {:>6} | {:>5} | {:>5} | {:>6.1} | {:>6.1} |",
+                i + 1,
+                format_count(cs.num_centroids),
+                cs.min,
+                cs.max,
+                cs.median,
+                cs.p90,
+                cs.p99,
+                cs.avg,
+                cs.std
+            )
+            .unwrap();
+        }
+        out
+    }
+
+    fn format_task_counts_table(snapshots: &[StatsSnapshot]) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        writeln!(out, "\n=== Task Counts ===").unwrap();
+        // Header
+        write!(out, "| CP |").unwrap();
+        for method in ALL_METHODS {
+            write!(out, " {:>8} |", method).unwrap();
+        }
+        writeln!(out).unwrap();
+        // Separator
+        write!(out, "|----|").unwrap();
+        for _ in ALL_METHODS {
+            write!(out, "----------|").unwrap();
+        }
+        writeln!(out).unwrap();
+        // Data rows
+        for (i, snap) in snapshots.iter().enumerate() {
+            write!(out, "| {:>2} |", i + 1).unwrap();
+            for method in ALL_METHODS {
+                let m = snap.get(method);
+                write!(out, " {:>8} |", format_count(m.calls)).unwrap();
+            }
+            writeln!(out).unwrap();
+        }
+        out
+    }
+
+    fn format_task_timing_table(snapshots: &[StatsSnapshot]) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        writeln!(out, "\n=== Task Total Time ===").unwrap();
+        // Header
+        write!(out, "| CP |").unwrap();
+        for method in ALL_METHODS {
+            write!(out, " {:>8} |", method).unwrap();
+        }
+        write!(out, " raw_pts |  raw/pt |").unwrap();
+        writeln!(out).unwrap();
+        // Separator
+        write!(out, "|----|").unwrap();
+        for _ in ALL_METHODS {
+            write!(out, "----------|").unwrap();
+        }
+        write!(out, "---------|---------|").unwrap();
+        writeln!(out).unwrap();
+        // Data rows
+        for (i, snap) in snapshots.iter().enumerate() {
+            write!(out, "| {:>2} |", i + 1).unwrap();
+            for method in ALL_METHODS {
+                let m = snap.get(method);
+                write!(out, " {:>8} |", format_duration(m.total_nanos)).unwrap();
+            }
+            // load_raw points and avg per point
+            let points = snap.load_raw_points;
+            let avg_per_point = if points > 0 {
+                format_duration(snap.load_raw.total_nanos / points)
+            } else {
+                "-".to_string()
+            };
+            write!(out, " {:>7} | {:>7} |", format_count(points), avg_per_point).unwrap();
+            writeln!(out).unwrap();
+        }
+        out
+    }
+
+    fn format_task_avg_time_table(snapshots: &[StatsSnapshot]) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        writeln!(out, "\n=== Task Avg Time ===").unwrap();
+        // Header
+        write!(out, "| CP |").unwrap();
+        for method in ALL_METHODS {
+            write!(out, " {:>8} |", method).unwrap();
+        }
+        writeln!(out).unwrap();
+        // Separator
+        write!(out, "|----|").unwrap();
+        for _ in ALL_METHODS {
+            write!(out, "----------|").unwrap();
+        }
+        writeln!(out).unwrap();
+        // Data rows
+        for (i, snap) in snapshots.iter().enumerate() {
+            write!(out, "| {:>2} |", i + 1).unwrap();
+            for method in ALL_METHODS {
+                let m = snap.get(method);
+                let avg = if m.calls > 0 {
+                    format_duration(m.total_nanos / m.calls)
+                } else {
+                    "-".to_string()
+                };
+                write!(out, " {:>8} |", avg).unwrap();
+            }
+            writeln!(out).unwrap();
+        }
+        out
+    }
+
+    /// Format all batch stats as summary tables.
+    pub fn format_batch_tables(snapshots: &[StatsSnapshot]) -> String {
+        let mut out = String::new();
+        out.push_str(&format_cluster_stats_table(snapshots));
+        out.push_str(&format_task_counts_table(snapshots));
+        out.push_str(&format_task_timing_table(snapshots));
+        out.push_str(&format_task_avg_time_table(snapshots));
+        out
+    }
+
+    /// RAII guard for timing a method.
+    pub struct TimedGuard<'a> {
+        stats: &'a MethodStats,
+        start: Instant,
+    }
+
+    impl<'a> TimedGuard<'a> {
+        #[inline]
+        pub fn new(stats: &'a MethodStats) -> Self {
+            Self {
+                stats,
+                start: Instant::now(),
+            }
+        }
+    }
+
+    impl Drop for TimedGuard<'_> {
+        #[inline]
+        fn drop(&mut self) {
+            self.stats.record(self.start.elapsed().as_nanos() as u64);
+        }
+    }
+}
+
+pub use stats::{format_batch_tables, ClusterSizeStats, QuantizedSpannStats, StatsSnapshot};
 
 // Blockfile prefixes
 pub const PREFIX_CENTER: &str = "center";
@@ -131,10 +533,14 @@ pub struct QuantizedSpannIndexWriter<I: VectorIndex> {
     // This contains the set of cluster ids in the balance (scrub/split/merge) routine.
     // It is used to prevent concurrent balancing attempts on the same clusters.
     balancing: Arc<DashSet<u32>>,
+
+    // === Statistics ===
+    stats: Arc<QuantizedSpannStats>,
 }
 
 impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
     pub async fn add(&self, id: u32, embedding: &[f32]) -> Result<(), QuantizedSpannError> {
+        let _guard = stats::TimedGuard::new(&self.stats.add);
         if embedding.len() != self.dimension {
             return Err(QuantizedSpannError::DimensionMismatch {
                 expected: self.dimension,
@@ -160,6 +566,88 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
         let mut entry = self.versions.entry(id).or_default();
         *entry += 1;
         *entry
+    }
+
+    /// Get the statistics for this index.
+    pub fn stats(&self) -> &QuantizedSpannStats {
+        &self.stats
+    }
+
+    /// Get current cluster sizes.
+    pub fn cluster_sizes(&self) -> Vec<usize> {
+        self.cluster_deltas
+            .iter()
+            .map(|entry| entry.value().length)
+            .collect()
+    }
+
+    /// Search for the k nearest neighbors of a query vector.
+    pub async fn search(
+        &self,
+        k: usize,
+        query: &[f32],
+        nprobe: usize,
+    ) -> Result<SearchResult, QuantizedSpannError> {
+        let _guard = stats::TimedGuard::new(&self.stats.search);
+        use std::collections::HashSet;
+
+        let rotated = self.rotate(query);
+
+        // Navigate: find nearest clusters using quantized centroid
+        let cluster_ids = self
+            .quantized_centroid
+            .search(&rotated, nprobe)
+            .map_err(|e| QuantizedSpannError::CentroidIndex(e.boxed()))?
+            .keys;
+
+        // Scan clusters and collect results
+        let mut measured = HashSet::new();
+        let mut results = Vec::new();
+
+        let q_norm = (f32::dot(&rotated, &rotated).unwrap_or(0.0) as f32).sqrt();
+
+        for cluster_id in cluster_ids {
+            self.load(cluster_id).await?;
+
+            let Some(delta) = self.cluster_deltas.get(&cluster_id) else {
+                continue;
+            };
+
+            let center = &delta.center;
+            let c_norm = (f32::dot(center, center).unwrap_or(0.0) as f32).sqrt();
+            let c_dot_q = f32::dot(center, &rotated).unwrap_or(0.0) as f32;
+            let r_q: Vec<f32> = rotated
+                .iter()
+                .zip(center.iter())
+                .map(|(q, c)| q - c)
+                .collect();
+
+            for (i, (id, version)) in delta.ids.iter().zip(delta.versions.iter()).enumerate() {
+                if !self.is_valid(*id, *version) || !measured.insert(*id) {
+                    continue;
+                }
+
+                let code_bits = self.config.quantize.data_bits().unwrap_or(4);
+                let distance = quantization::distance_query(
+                    code_bits,
+                    delta.codes[i].as_ref(),
+                    &self.distance_function,
+                    &r_q,
+                    c_norm,
+                    c_dot_q,
+                    q_norm,
+                );
+                results.push((*id, distance));
+            }
+        }
+
+        // Sort by distance ascending and truncate to k
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+
+        // Convert to SearchResult
+        let (keys, distances): (Vec<u32>, Vec<f32>) = results.into_iter().unzip();
+        Ok(SearchResult { keys, distances })
     }
 }
 
@@ -217,15 +705,28 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
         self.distance_function.distance(a, b)
     }
 
+    /// Quantize a vector relative to a centroid, recording time in stats.
+    fn timed_quantize(&self, bits: u8, embedding: &[f32], centroid: &[f32]) -> Arc<[u8]> {
+        let _guard = stats::TimedGuard::new(&self.stats.quantize);
+        quantization::quantize(bits, embedding, centroid)
+    }
+
     /// Remove a cluster from both centroid indexes and register as tombstone.
     /// Load raw embeddings and returns the delta if the cluster existed.
     async fn drop(&self, cluster_id: u32) -> Result<Option<QuantizedDelta>, QuantizedSpannError> {
-        self.raw_centroid
-            .remove(cluster_id)
-            .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
-        self.quantized_centroid
-            .remove(cluster_id)
-            .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
+        let _guard = stats::TimedGuard::new(&self.stats.drop);
+        {
+            let _g = stats::TimedGuard::new(&self.stats.raw_rm);
+            self.raw_centroid
+                .remove(cluster_id)
+                .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
+        }
+        {
+            let _g = stats::TimedGuard::new(&self.stats.q_rm);
+            self.quantized_centroid
+                .remove(cluster_id)
+                .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
+        }
         self.tombstones.insert(cluster_id);
 
         let Some((_, delta)) = self.cluster_deltas.remove(&cluster_id) else {
@@ -252,6 +753,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
 
     /// Load cluster data from reader into deltas.
     async fn load(&self, cluster_id: u32) -> Result<(), QuantizedSpannError> {
+        let _guard = stats::TimedGuard::new(&self.stats.load);
         let Some(reader) = &self.quantized_cluster_reader else {
             return Ok(());
         };
@@ -272,7 +774,10 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
             return Ok(());
         };
 
-        let code_size = Code::<4, &[u8]>::size(self.dimension);
+        let bits = self.config.quantize.data_bits().unwrap_or(4);
+        let code_size = quantization::code_size(bits, self.dimension);
+        // let code_size = Code::<bits, _>::size(self.dimension);
+
         if let Some(mut delta) = self.cluster_deltas.get_mut(&cluster_id) {
             if delta.ids.len() < delta.length {
                 for ((id, version), code) in persisted
@@ -293,6 +798,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
 
     /// Load raw embeddings for given ids into the embeddings cache.
     async fn load_raw(&self, ids: &[u32]) -> Result<(), QuantizedSpannError> {
+        let _guard = stats::TimedGuard::new(&self.stats.load_raw);
         let Some(reader) = &self.raw_embedding_reader else {
             return Ok(());
         };
@@ -307,6 +813,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
             .load_data_for_keys(missing_ids.iter().map(|id| (String::new(), *id)))
             .await;
 
+        let num_loaded = missing_ids.len();
         for id in missing_ids {
             if let Some(record) = reader
                 .get("", id)
@@ -317,11 +824,16 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
             }
         }
 
+        self.stats
+            .load_raw_points
+            .fetch_add(num_loaded as u64, Ordering::Relaxed);
+
         Ok(())
     }
 
     /// Merge a small cluster into a nearby cluster.
     async fn merge(&self, cluster_id: u32, depth: u32) -> Result<(), QuantizedSpannError> {
+        let _guard = stats::TimedGuard::new(&self.stats.merge);
         if depth > MAX_BALANCE_DEPTH {
             return Ok(());
         }
@@ -357,10 +869,9 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
             let dist_to_target = self.distance(&embedding, &target_center);
             let dist_to_source = self.distance(&embedding, &source_center);
 
+            let bits = self.config.quantize.data_bits().unwrap_or(4);
             if dist_to_target <= dist_to_source {
-                let code = Code::<4>::quantize(&embedding, &target_center)
-                    .as_ref()
-                    .into();
+                let code = self.timed_quantize(bits, &embedding, &target_center);
                 if self
                     .append(nearest_cluster_id, *id, *version, code)
                     .is_none()
@@ -379,7 +890,8 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
 
     /// Query the centroid index for the nearest cluster heads.
     fn navigate(&self, query: &[f32], count: usize) -> Result<SearchResult, QuantizedSpannError> {
-        self.raw_centroid
+        let _guard = stats::TimedGuard::new(&self.stats.navigate);
+        self.quantized_centroid
             .search(query, count)
             .map_err(|e| QuantizedSpannError::CentroidIndex(e.boxed()))
     }
@@ -393,6 +905,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
         embedding: Arc<[f32]>,
         depth: u32,
     ) -> Result<(), QuantizedSpannError> {
+        let _guard = stats::TimedGuard::new(&self.stats.reassign);
         if !self.is_valid(id, version) {
             return Ok(());
         }
@@ -436,6 +949,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
         target_cluster_ids: &[u32],
         version: u32,
     ) -> Result<Vec<u32>, QuantizedSpannError> {
+        let bits = self.config.quantize.data_bits().unwrap_or(4);
         let mut registered = false;
         let mut staging = Vec::new();
 
@@ -444,7 +958,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
                 continue;
             };
 
-            let code = Code::<4>::quantize(&embedding, &centroid).as_ref().into();
+            let code = self.timed_quantize(bits, &embedding, &centroid);
 
             let Some(len) = self.append(*cluster_id, id, version, code) else {
                 continue;
@@ -462,7 +976,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
         }
 
         if !registered {
-            let code = Code::<4>::quantize(&embedding, &embedding).as_ref().into();
+            let code = self.timed_quantize(bits, &embedding, &embedding);
             let delta = QuantizedDelta {
                 center: embedding,
                 codes: vec![code],
@@ -541,6 +1055,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
     /// Does NOT trigger split/merge - use balance() for that.
     /// Returns the new length after scrubbing, or None if cluster not found.
     async fn scrub(&self, cluster_id: u32) -> Result<Option<usize>, QuantizedSpannError> {
+        let _guard = stats::TimedGuard::new(&self.stats.scrub);
         self.load(cluster_id).await?;
 
         let new_len = if let Some(mut delta) = self.cluster_deltas.get_mut(&cluster_id) {
@@ -566,24 +1081,33 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
 
     /// Spawn a new cluster and register it in the centroid index.
     fn spawn(&self, delta: QuantizedDelta) -> Result<u32, QuantizedSpannError> {
+        let _guard = stats::TimedGuard::new(&self.stats.spawn);
         let cluster_id = self.next_cluster_id.fetch_add(1, Ordering::Relaxed);
         let center = delta.center.clone();
         self.cluster_deltas.insert(cluster_id, delta);
-        self.raw_centroid
-            .add(cluster_id, &center)
-            .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
-        self.quantized_centroid
-            .add(cluster_id, &center)
-            .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
+        {
+            let _g = stats::TimedGuard::new(&self.stats.raw_add);
+            self.raw_centroid
+                .add(cluster_id, &center)
+                .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
+        }
+        {
+            let _g = stats::TimedGuard::new(&self.stats.q_add);
+            self.quantized_centroid
+                .add(cluster_id, &center)
+                .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
+        }
         Ok(cluster_id)
     }
 
     /// Split a large cluster into two smaller clusters using 2-means clustering.
     async fn split(&self, cluster_id: u32, depth: u32) -> Result<(), QuantizedSpannError> {
+        let _guard = stats::TimedGuard::new(&self.stats.split);
         let Some(delta) = self.drop(cluster_id).await? else {
             return Ok(());
         };
         let old_center = delta.center.clone();
+        let code_bits = self.config.quantize.data_bits().unwrap_or(4);
 
         let embeddings = delta
             .ids
@@ -616,7 +1140,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
             center: left_center.clone(),
             codes: left_group
                 .iter()
-                .map(|(_, _, emb)| Code::<4>::quantize(emb, &left_center).as_ref().into())
+                .map(|(_, _, emb)| self.timed_quantize(code_bits, emb, &left_center))
                 .collect(),
             ids: left_group.iter().map(|(id, _, _)| *id).collect(),
             length: left_group.len(),
@@ -628,7 +1152,7 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
             center: right_center.clone(),
             codes: right_group
                 .iter()
-                .map(|(_, _, emb)| Code::<4>::quantize(emb, &right_center).as_ref().into())
+                .map(|(_, _, emb)| self.timed_quantize(code_bits, emb, &right_center))
                 .collect(),
             ids: right_group.iter().map(|(id, _, _)| *id).collect(),
             length: right_group.len(),
@@ -753,23 +1277,29 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
                     continue;
                 }
 
-                let code = Code::<4, &[u8]>::new(code.as_ref());
+                let code_bytes = code.as_ref();
 
-                let left_dist = code.distance_query(
+                let left_dist = quantization::distance_query(
+                    code_bits,
+                    code_bytes,
                     &self.distance_function,
                     &left_r_q,
                     c_norm,
                     left_c_dot_q,
                     left_q_norm,
                 );
-                let right_dist = code.distance_query(
+                let right_dist = quantization::distance_query(
+                    code_bits,
+                    code_bytes,
                     &self.distance_function,
                     &right_r_q,
                     c_norm,
                     right_c_dot_q,
                     right_q_norm,
                 );
-                let neighbor_dist = code.distance_query(
+                let neighbor_dist = quantization::distance_query(
+                    code_bits,
+                    code_bytes,
                     &self.distance_function,
                     &neighbor_r_q,
                     c_norm,
@@ -781,7 +1311,9 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
                     continue;
                 }
 
-                let old_dist = code.distance_query(
+                let old_dist = quantization::distance_query(
+                    code_bits,
+                    code_bytes,
                     &self.distance_function,
                     &old_r_q,
                     c_norm,
@@ -1024,6 +1556,8 @@ impl QuantizedSpannIndexWriter<USearchIndex> {
             .unwrap_or(default_construction_ef_spann());
         let ef_search = config.ef_search.unwrap_or(default_search_ef_spann());
 
+        let centroid_bits = config.centroid_bits();
+
         // Build USearch config from params
         let usearch_config = USearchIndexConfig {
             collection_id,
@@ -1035,6 +1569,7 @@ impl QuantizedSpannIndexWriter<USearchIndex> {
             expansion_add: ef_construction,
             expansion_search: ef_search,
             quantization_center: None,
+            centroid_quantization_bits: centroid_bits,
         };
 
         // Create centroid indexes
@@ -1081,6 +1616,8 @@ impl QuantizedSpannIndexWriter<USearchIndex> {
             raw_embedding_reader: None,
             // === Dedup Sets ===
             balancing: DashSet::new().into(),
+            // === Statistics ===
+            stats: Arc::new(QuantizedSpannStats::default()),
         })
     }
 
@@ -1197,6 +1734,8 @@ impl QuantizedSpannIndexWriter<USearchIndex> {
             .unwrap_or(default_construction_ef_spann());
         let ef_search = config.ef_search.unwrap_or(default_search_ef_spann());
 
+        let centroid_bits = config.centroid_bits();
+
         // Build USearch config from params
         let usearch_config = USearchIndexConfig {
             collection_id,
@@ -1208,6 +1747,7 @@ impl QuantizedSpannIndexWriter<USearchIndex> {
             expansion_add: ef_construction,
             expansion_search: ef_search,
             quantization_center: None,
+            centroid_quantization_bits: centroid_bits,
         };
 
         // Step 1: Open centroid indexes
@@ -1347,6 +1887,8 @@ impl QuantizedSpannIndexWriter<USearchIndex> {
             raw_embedding_reader,
             // === Dedup Sets ===
             balancing: DashSet::new().into(),
+            // === Statistics ===
+            stats: Arc::new(QuantizedSpannStats::default()),
         })
     }
 
@@ -1411,6 +1953,7 @@ impl QuantizedSpannIndexWriter<USearchIndex> {
                 expansion_add: ef_construction,
                 expansion_search: ef_search,
                 quantization_center: None,
+                centroid_quantization_bits: self.config.centroid_bits(),
             };
 
             // Rebuild raw centroid index
@@ -1432,12 +1975,18 @@ impl QuantizedSpannIndexWriter<USearchIndex> {
             // Re-add all cluster centers to both indexes
             for entry in self.cluster_deltas.iter() {
                 let cluster_id = *entry.key();
-                self.raw_centroid
-                    .add(cluster_id, &entry.center)
-                    .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
-                self.quantized_centroid
-                    .add(cluster_id, &entry.center)
-                    .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
+                {
+                    let _g = stats::TimedGuard::new(&self.stats.raw_add);
+                    self.raw_centroid
+                        .add(cluster_id, &entry.center)
+                        .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
+                }
+                {
+                    let _g = stats::TimedGuard::new(&self.stats.q_add);
+                    self.quantized_centroid
+                        .add(cluster_id, &entry.center)
+                        .map_err(|err| QuantizedSpannError::CentroidIndex(err.boxed()))?;
+                }
             }
 
             // Update center
@@ -1541,6 +2090,14 @@ mod tests {
     const TEST_EPSILON: f32 = 1e-5;
 
     fn test_config() -> SpannIndexConfig {
+        test_config_with_quantization(Quantization::FourBitRabitQWithUSearch)
+    }
+
+    fn test_config_1bit() -> SpannIndexConfig {
+        test_config_with_quantization(Quantization::OneBitRabitQWithUSearch)
+    }
+
+    fn test_config_with_quantization(quantize: Quantization) -> SpannIndexConfig {
         SpannIndexConfig {
             write_nprobe: Some(4),
             nreplica_count: Some(2),
@@ -1559,7 +2116,8 @@ mod tests {
             initial_lambda: None,
             num_centers_to_merge_to: None,
             max_neighbors: Some(8),
-            quantize: Quantization::FourBitRabitQWithUSearch,
+            quantize,
+            centroid_bits: None,
         }
     }
 
@@ -1708,9 +2266,7 @@ mod tests {
         // --- append ---
         // Create a test embedding for point 10 and quantize it relative to center1
         let emb_10 = [1.0f32, 0.1, 0.0, 0.0];
-        let code_10: Arc<[u8]> = Code::<4, Vec<u8>>::quantize(&emb_10, &center1)
-            .as_ref()
-            .into();
+        let code_10: Arc<[u8]> = Code::<4>::quantize(&emb_10, &center1).as_ref().into();
         let v10 = writer.remove(10);
         let new_len = writer.append(cluster_id_1, 10, v10, code_10.clone());
         assert_eq!(new_len, Some(1));
@@ -1996,7 +2552,7 @@ mod tests {
             "rotation mismatch for id 102"
         );
 
-        // --- detach ---
+        // --- drop ---
         // Spawn a new cluster with points 200, 201
         let center2: Arc<[f32]> = Arc::from([0.0f32, 0.0, 0.0, 1.0]);
 
@@ -2374,7 +2930,7 @@ mod tests {
         let v10 = writer.remove(10);
         let v11 = writer.remove(11);
         let v12 = writer.remove(12);
-        let code_a: Arc<[u8]> = Code::<4, Vec<u8>>::quantize(&[1.0, 0.0, 0.0, 0.0], &center_a)
+        let code_a: Arc<[u8]> = Code::<4>::quantize(&[1.0, 0.0, 0.0, 0.0], &center_a)
             .as_ref()
             .into();
         let delta_a = QuantizedDelta {
@@ -2392,7 +2948,7 @@ mod tests {
         let v21 = writer.remove(21);
         let v22 = writer.remove(22);
         let v23 = writer.remove(23);
-        let code_b: Arc<[u8]> = Code::<4, Vec<u8>>::quantize(&[0.0, 1.0, 0.0, 0.0], &center_b)
+        let code_b: Arc<[u8]> = Code::<4>::quantize(&[0.0, 1.0, 0.0, 0.0], &center_b)
             .as_ref()
             .into();
         let delta_b = QuantizedDelta {
@@ -2413,7 +2969,7 @@ mod tests {
         let center_c: Arc<[f32]> = Arc::from([0.0f32, 0.0, 1.0, 0.0]);
         let v30 = writer.remove(30);
         let v31 = writer.remove(31);
-        let code_c: Arc<[u8]> = Code::<4, Vec<u8>>::quantize(&[0.0, 0.0, 1.0, 0.0], &center_c)
+        let code_c: Arc<[u8]> = Code::<4>::quantize(&[0.0, 0.0, 1.0, 0.0], &center_c)
             .as_ref()
             .into();
         let delta_c = QuantizedDelta {
@@ -2429,7 +2985,7 @@ mod tests {
         let center_d: Arc<[f32]> = Arc::from([0.0f32, 0.0, 0.0, 1.0]);
         let v40 = writer.remove(40);
         let v41 = writer.remove(41);
-        let code_d: Arc<[u8]> = Code::<4, Vec<u8>>::quantize(&[0.0, 0.0, 0.0, 1.0], &center_d)
+        let code_d: Arc<[u8]> = Code::<4>::quantize(&[0.0, 0.0, 0.0, 1.0], &center_d)
             .as_ref()
             .into();
         let delta_d = QuantizedDelta {
@@ -2928,13 +3484,470 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stale_register() {
-        // === Setup ===
+    async fn test_basic_operations_1bit() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let storage = test_storage(&tmp_dir);
         let usearch_provider = test_usearch_provider(storage);
 
         let writer = QuantizedSpannIndexWriter::<USearchIndex>::create(
+            TEST_CLUSTER_BLOCK_SIZE,
+            CollectionUuid::new(),
+            test_config_1bit(),
+            TEST_DIMENSION,
+            test_distance_function(),
+            None,
+            "".to_string(),
+            &usearch_provider,
+        )
+        .await
+        .expect("Failed to create 1-bit writer");
+
+        // Spawn a cluster
+        let center: Arc<[f32]> = Arc::from([1.0f32, 0.0, 0.0, 0.0]);
+        let delta = QuantizedDelta {
+            center: center.clone(),
+            codes: vec![],
+            ids: vec![],
+            length: 0,
+            versions: vec![],
+        };
+        let cluster_id = writer.spawn(delta).expect("spawn failed");
+        assert!(writer.centroid(cluster_id).is_some());
+
+        // Navigate should find our cluster
+        let result = writer
+            .navigate(&[1.0, 0.0, 0.0, 0.0], 5)
+            .expect("navigate failed");
+        assert!(result.keys.contains(&cluster_id));
+
+        // Append a 1-bit quantized code
+        let emb = [1.0f32, 0.1, 0.0, 0.0];
+        let code: Arc<[u8]> = Code::<1>::quantize(&emb, &center).as_ref().into();
+        let v1 = writer.remove(10);
+        let new_len = writer.append(cluster_id, 10, v1, code.clone());
+        assert_eq!(new_len, Some(1));
+
+        // Verify delta
+        let delta = writer
+            .cluster_deltas
+            .get(&cluster_id)
+            .expect("delta not found")
+            .clone();
+        assert!(delta.ids.contains(&10));
+        assert_eq!(delta.length, 1);
+
+        // 1-bit code size differs from 4-bit
+        let code_1bit_size = Code::<1>::size(TEST_DIMENSION);
+        let code_4bit_size = Code::<4>::size(TEST_DIMENSION);
+        assert_ne!(
+            code_1bit_size, code_4bit_size,
+            "1-bit and 4-bit code sizes should differ"
+        );
+        assert_eq!(delta.codes[0].len(), code_1bit_size);
+
+        // Spawn more clusters for RNG test
+        let center2: Arc<[f32]> = Arc::from([0.0f32, 1.0, 0.0, 0.0]);
+        writer
+            .spawn(QuantizedDelta {
+                center: center2,
+                codes: vec![],
+                ids: vec![],
+                length: 0,
+                versions: vec![],
+            })
+            .expect("spawn 2 failed");
+
+        let center3: Arc<[f32]> = Arc::from([0.0f32, 0.0, 1.0, 0.0]);
+        writer
+            .spawn(QuantizedDelta {
+                center: center3,
+                codes: vec![],
+                ids: vec![],
+                length: 0,
+                versions: vec![],
+            })
+            .expect("spawn 3 failed");
+
+        // RNG select on navigate results
+        let candidates = writer
+            .navigate(&[1.0, 0.0, 0.0, 0.0], 10)
+            .expect("navigate failed");
+        let selected = writer.rng_select(&candidates);
+        assert!(!selected.keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_open_finish_commit_1bit() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(&tmp_dir);
+        let collection_id = CollectionUuid::new();
+
+        let blockfile_provider = test_blockfile_provider(storage.clone());
+        let usearch_provider = test_usearch_provider(storage.clone());
+
+        let mut writer = QuantizedSpannIndexWriter::<USearchIndex>::create(
+            TEST_CLUSTER_BLOCK_SIZE,
+            collection_id,
+            test_config_1bit(),
+            TEST_DIMENSION,
+            test_distance_function(),
+            None,
+            "".to_string(),
+            &usearch_provider,
+        )
+        .await
+        .expect("Failed to create 1-bit writer");
+
+        // Build 4 clusters with 1-bit codes
+        let centers: Vec<Arc<[f32]>> = vec![
+            Arc::from([1.0f32, 0.0, 0.0, 0.0]),
+            Arc::from([0.0f32, 1.0, 0.0, 0.0]),
+            Arc::from([0.0f32, 0.0, 1.0, 0.0]),
+            Arc::from([0.0f32, 0.0, 0.0, 1.0]),
+        ];
+
+        let mut cluster_ids = Vec::new();
+        for (ci, center) in centers.iter().enumerate() {
+            let base_id = (ci as u32) * 10;
+            let mut codes = Vec::new();
+            let mut ids = Vec::new();
+            let mut versions = Vec::new();
+            for j in 0..3u32 {
+                let id = base_id + j;
+                let emb: Vec<f32> = center.iter().map(|&c| c + (j as f32) * 0.01).collect();
+                let code: Arc<[u8]> = Code::<1>::quantize(&emb, center).as_ref().into();
+                let v = writer.remove(id);
+                codes.push(code);
+                ids.push(id);
+                versions.push(v);
+            }
+            let delta = QuantizedDelta {
+                center: center.clone(),
+                codes,
+                ids,
+                length: 3,
+                versions,
+            };
+            cluster_ids.push(writer.spawn(delta).expect("spawn failed"));
+        }
+
+        let test_vector = [1.0f32, 2.0, 3.0, 4.0];
+        let expected_rotated = writer.rotate(&test_vector);
+
+        // Finish, commit, flush
+        writer
+            .finish(&usearch_provider)
+            .await
+            .expect("finish failed");
+        let flusher = Box::pin(writer.commit(&blockfile_provider, &usearch_provider))
+            .await
+            .expect("commit failed");
+        let file_ids = Box::pin(flusher.flush()).await.expect("flush failed");
+
+        // Reopen
+        let blockfile_provider = test_blockfile_provider(storage.clone());
+        let usearch_provider = test_usearch_provider(storage.clone());
+
+        let writer = QuantizedSpannIndexWriter::<USearchIndex>::open(
+            TEST_CLUSTER_BLOCK_SIZE,
+            collection_id,
+            test_config_1bit(),
+            TEST_DIMENSION,
+            test_distance_function(),
+            file_ids,
+            None,
+            "".to_string(),
+            None,
+            &blockfile_provider,
+            &usearch_provider,
+        )
+        .await
+        .expect("Failed to reopen 1-bit writer");
+
+        // Rotation matrix preserved
+        let actual_rotated = writer.rotate(&test_vector);
+        assert!(
+            writer.distance(&expected_rotated, &actual_rotated) < TEST_EPSILON,
+            "Rotation matrix should be preserved across open"
+        );
+
+        // All clusters exist with correct lengths
+        for &cid in &cluster_ids {
+            let delta = writer
+                .cluster_deltas
+                .get(&cid)
+                .expect("cluster not found after reopen");
+            assert_eq!(delta.length, 3, "cluster {} should have 3 points", cid);
+        }
+
+        // Load and verify 1-bit code sizes
+        let code_1bit_size = Code::<1>::size(TEST_DIMENSION);
+        for &cid in &cluster_ids {
+            writer.load(cid).await.expect("load failed");
+            let delta = writer.cluster_deltas.get(&cid).unwrap();
+            assert_eq!(delta.ids.len(), 3);
+            assert_eq!(delta.codes.len(), 3);
+            for code in &delta.codes {
+                assert_eq!(
+                    code.len(),
+                    code_1bit_size,
+                    "persisted code size should match 1-bit code size"
+                );
+            }
+        }
+
+        // Navigate finds clusters
+        for center in &centers {
+            let result = writer.navigate(center, 10).expect("navigate failed");
+            assert!(
+                !result.keys.is_empty(),
+                "navigate should find at least one cluster"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_persist_1bit() {
+        const SEED: u64 = 99;
+        const BATCH_SIZE: usize = 1_000;
+        const CHUNK_SIZE: usize = 200;
+        const NUM_CYCLES: usize = 4;
+        const TOTAL_VECTORS: usize = BATCH_SIZE * NUM_CYCLES;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(&tmp_dir);
+        let collection_id = CollectionUuid::new();
+
+        let embeddings = {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+            Arc::new(
+                (0..TOTAL_VECTORS)
+                    .map(|_| [rng.gen(), rng.gen(), rng.gen(), rng.gen()])
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let blockfile_provider = test_blockfile_provider(storage.clone());
+        let raw_writer = blockfile_provider
+            .write::<u32, &DataRecord<'_>>(
+                BlockfileWriterOptions::new("".to_string()).ordered_mutations(),
+            )
+            .await
+            .expect("Failed to create raw embedding writer");
+
+        for (id, embedding) in embeddings.iter().enumerate() {
+            let record = DataRecord {
+                id: "",
+                embedding: embedding.as_slice(),
+                metadata: None,
+                document: None,
+            };
+            raw_writer
+                .set("", id as u32, &record)
+                .await
+                .expect("Failed to write raw embedding");
+        }
+
+        let raw_flusher = raw_writer
+            .commit::<u32, &DataRecord<'_>>()
+            .await
+            .expect("Failed to commit raw embeddings");
+        let raw_embedding_id = raw_flusher.id();
+        raw_flusher
+            .flush::<u32, &DataRecord<'_>>()
+            .await
+            .expect("Failed to flush raw embeddings");
+
+        let usearch_provider = test_usearch_provider(storage.clone());
+
+        let mut writer = QuantizedSpannIndexWriter::<USearchIndex>::create(
+            TEST_CLUSTER_BLOCK_SIZE,
+            collection_id,
+            test_config_1bit(),
+            TEST_DIMENSION,
+            test_distance_function(),
+            None,
+            "".to_string(),
+            &usearch_provider,
+        )
+        .await
+        .expect("Failed to create 1-bit writer");
+
+        let mut file_ids;
+
+        for cycle in 0..NUM_CYCLES {
+            let start_id = cycle * BATCH_SIZE;
+            let end_id = start_id + BATCH_SIZE;
+
+            if cycle > 0 {
+                for id in 0..start_id {
+                    assert!(
+                        writer.versions.contains_key(&(id as u32)),
+                        "Cycle {}: missing ID {} in version map",
+                        cycle,
+                        id
+                    );
+                }
+            }
+
+            let writer_arc = Arc::new(writer);
+            let mut handles = vec![];
+
+            for chunk_start in (start_id..end_id).step_by(CHUNK_SIZE) {
+                let chunk_end = (chunk_start + CHUNK_SIZE).min(end_id);
+                let writer_clone = Arc::clone(&writer_arc);
+                let embeddings_clone = Arc::clone(&embeddings);
+
+                handles.push(tokio::spawn(async move {
+                    for id in chunk_start..chunk_end {
+                        writer_clone
+                            .add(id as u32, &embeddings_clone[id])
+                            .await
+                            .expect("add failed");
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.await.expect("task panicked");
+            }
+
+            writer = Arc::try_unwrap(writer_arc)
+                .unwrap_or_else(|_| panic!("Arc still has multiple owners"));
+
+            let mut rng = rand::rngs::StdRng::seed_from_u64(SEED + cycle as u64);
+            let test_vec = [rng.gen(), rng.gen(), rng.gen(), rng.gen()];
+            let expected_rotated = writer.rotate(&test_vec);
+
+            let blockfile_provider = test_blockfile_provider(storage.clone());
+            let usearch_provider = test_usearch_provider(storage.clone());
+
+            writer
+                .finish(&usearch_provider)
+                .await
+                .expect("finish failed");
+            let flusher = Box::pin(writer.commit(&blockfile_provider, &usearch_provider))
+                .await
+                .expect("commit failed");
+            file_ids = Box::pin(flusher.flush()).await.expect("flush failed");
+
+            let blockfile_provider = test_blockfile_provider(storage.clone());
+            let usearch_provider = test_usearch_provider(storage.clone());
+
+            let raw_reader = blockfile_provider
+                .read::<u32, DataRecord<'static>>(BlockfileReaderOptions::new(
+                    raw_embedding_id,
+                    "".to_string(),
+                ))
+                .await
+                .expect("Failed to open raw embedding reader");
+
+            writer = QuantizedSpannIndexWriter::<USearchIndex>::open(
+                TEST_CLUSTER_BLOCK_SIZE,
+                collection_id,
+                test_config_1bit(),
+                TEST_DIMENSION,
+                test_distance_function(),
+                file_ids.clone(),
+                None,
+                "".to_string(),
+                Some(raw_reader),
+                &blockfile_provider,
+                &usearch_provider,
+            )
+            .await
+            .expect("Failed to reopen 1-bit writer");
+
+            let actual_rotated = writer.rotate(&test_vec);
+            assert!(
+                writer.distance(&expected_rotated, &actual_rotated) < TEST_EPSILON,
+                "Cycle {}: rotation matrix changed after persistence",
+                cycle
+            );
+        }
+
+        assert_eq!(
+            writer.versions.len(),
+            TOTAL_VECTORS,
+            "Expected {} IDs in version map, got {}",
+            TOTAL_VECTORS,
+            writer.versions.len()
+        );
+
+        for id in 0..TOTAL_VECTORS {
+            assert!(
+                writer.versions.contains_key(&(id as u32)),
+                "Final: missing ID {} in version map",
+                id
+            );
+        }
+
+        let cluster_ids = writer
+            .cluster_deltas
+            .iter()
+            .map(|e| *e.key())
+            .collect::<Vec<_>>();
+
+        let code_1bit_size = Code::<1>::size(TEST_DIMENSION);
+
+        for cluster_id in &cluster_ids {
+            let length_before = writer.cluster_deltas.get(cluster_id).unwrap().length;
+            writer.load(*cluster_id).await.expect("load failed");
+            let delta = writer.cluster_deltas.get(cluster_id).unwrap();
+            assert_eq!(delta.ids.len(), length_before);
+            assert_eq!(delta.codes.len(), length_before);
+            assert_eq!(delta.versions.len(), length_before);
+
+            for code in &delta.codes {
+                assert_eq!(
+                    code.len(),
+                    code_1bit_size,
+                    "Cluster {}: code size {} != expected 1-bit size {}",
+                    cluster_id,
+                    code.len(),
+                    code_1bit_size,
+                );
+            }
+        }
+
+        for id in 0..TOTAL_VECTORS {
+            let id = id as u32;
+            let global = *writer.versions.get(&id).expect("missing ID");
+
+            let has_current_copy = writer.cluster_deltas.iter().any(|delta| {
+                delta
+                    .ids
+                    .iter()
+                    .zip(delta.versions.iter())
+                    .any(|(did, dver)| *did == id && *dver == global)
+            });
+
+            assert!(
+                has_current_copy,
+                "ID {} has no up-to-date copy in any cluster (global version: {})",
+                id, global
+            );
+        }
+
+        for cluster_id in &cluster_ids {
+            let result = writer.raw_centroid.get(*cluster_id);
+            assert!(
+                result.is_ok() && result.unwrap().is_some(),
+                "Cluster {} not found in raw_centroid index",
+                cluster_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stale_register() {
+        // === Setup ===
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(&tmp_dir);
+
+        let usearch_provider = test_usearch_provider(storage.clone());
+
+        let mut writer = QuantizedSpannIndexWriter::<USearchIndex>::create(
             TEST_CLUSTER_BLOCK_SIZE,
             CollectionUuid::new(),
             test_config(),
@@ -2950,9 +3963,7 @@ mod tests {
         // --- Spawn a target cluster with a filler point ---
         let center: Arc<[f32]> = Arc::from([1.0f32, 0.0, 0.0, 0.0]);
         let emb_20 = [1.0f32, 0.0, 0.0, 0.0];
-        let code_20: Arc<[u8]> = Code::<4, Vec<u8>>::quantize(&emb_20, &center)
-            .as_ref()
-            .into();
+        let code_20: Arc<[u8]> = Code::<4>::quantize(&emb_20, &center).as_ref().into();
         let v20 = writer.remove(20);
 
         let delta = QuantizedDelta {
@@ -2974,8 +3985,6 @@ mod tests {
         assert_eq!(*writer.versions.get(&10).unwrap(), v10 + 1);
 
         // --- Call register with stale version ---
-        // This simulates what reassign would do if is_valid passed before the
-        // concurrent remove happened.
         writer
             .register(10, emb_10, &[cluster_id], v10)
             .expect("register failed");
@@ -2988,7 +3997,6 @@ mod tests {
         );
 
         // --- Point 10 should NOT be alive ---
-        // Cluster entry has v10, but global is v10+1, so is_valid returns false.
         let current_version = *writer.versions.get(&10).unwrap();
         let has_live_copy = writer.cluster_deltas.iter().any(|entry| {
             entry
