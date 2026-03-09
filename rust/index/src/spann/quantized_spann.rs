@@ -158,6 +158,8 @@ pub mod stats {
         pub q_rm: MethodSnapshot,
         pub load_raw_points: u64,
         pub cluster_stats: ClusterSizeStats,
+        /// Wall-clock time for this checkpoint (set by the caller, not by snapshot()).
+        pub wall_nanos: u64,
     }
 
     impl StatsSnapshot {
@@ -234,6 +236,7 @@ pub mod stats {
                 q_rm: snap(&self.q_rm),
                 load_raw_points: self.load_raw_points.load(Ordering::Relaxed),
                 cluster_stats: ClusterSizeStats::from_sizes(cluster_sizes),
+                wall_nanos: 0,
             }
         }
     }
@@ -341,14 +344,14 @@ pub mod stats {
         for method in ALL_METHODS {
             write!(out, " {:>8} |", method).unwrap();
         }
-        write!(out, " raw_pts |  raw/pt |").unwrap();
+        write!(out, " raw_pts |  raw/pt |    total |").unwrap();
         writeln!(out).unwrap();
         // Separator
         write!(out, "|----|").unwrap();
         for _ in ALL_METHODS {
             write!(out, "----------|").unwrap();
         }
-        write!(out, "---------|---------|").unwrap();
+        write!(out, "---------|---------|----------|").unwrap();
         writeln!(out).unwrap();
         // Data rows
         for (i, snap) in snapshots.iter().enumerate() {
@@ -364,7 +367,19 @@ pub mod stats {
             } else {
                 "-".to_string()
             };
-            write!(out, " {:>7} | {:>7} |", format_count(points), avg_per_point).unwrap();
+            let wall = if snap.wall_nanos > 0 {
+                format_duration(snap.wall_nanos)
+            } else {
+                "-".to_string()
+            };
+            write!(
+                out,
+                " {:>7} | {:>7} | {:>8} |",
+                format_count(points),
+                avg_per_point,
+                wall
+            )
+            .unwrap();
             writeln!(out).unwrap();
         }
         out
@@ -410,6 +425,31 @@ pub mod stats {
         out.push_str(&format_task_counts_table(snapshots));
         out.push_str(&format_task_timing_table(snapshots));
         out.push_str(&format_task_avg_time_table(snapshots));
+        out.push_str(
+            "\n=== Legend ===\n\
+             Write path:\n\
+             \x20 add       - top-level add(id, embedding): navigate + register + balance\n\
+             \x20 navigate  - query centroid HNSW index for nearest clusters\n\
+             \x20 register  - quantize vector and append to target cluster(s)\n\
+             \x20 spawn     - create a new cluster and insert centroid into HNSW indexes\n\
+             Balance path:\n\
+             \x20 scrub     - load cluster from reader, remove tombstoned entries\n\
+             \x20 split     - split an oversized cluster via 2-means into two new clusters\n\
+             \x20 merge     - merge an undersized cluster into its nearest neighbor\n\
+             \x20 reassign  - re-add a displaced vector after split/merge\n\
+             \x20 drop      - remove a cluster from centroid indexes and load its raw embeddings\n\
+             I/O:\n\
+             \x20 load      - load quantized cluster data from blockfile reader into memory\n\
+             \x20 load_raw  - load raw f32 embeddings from blockfile reader into cache\n\
+             Quantization:\n\
+             \x20 quantize  - encode a vector into a RaBitQ code relative to its centroid\n\
+             Search:\n\
+             \x20 search    - full query: centroid navigate + cluster scan + rerank\n\
+             Derived:\n\
+             \x20 raw_pts   - number of raw embedding points loaded during load_raw\n\
+             \x20 raw/pt    - average time per raw embedding point (load_raw total / raw_pts)\n\
+             \x20 total     - wall-clock time for the checkpoint (load + raw_write + index + commit)\n",
+        );
         out
     }
 

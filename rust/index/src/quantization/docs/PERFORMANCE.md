@@ -320,23 +320,69 @@ Usearch also has a global lock internally. If we chose to fork Usearch and make 
 
 ## Indexing Performance
 
-### Navigate using quantized centroids
+### 1bit vs 4bit
 
-- speedup
+Dataset: wikipedia-en (1024 dims)
+4bit: cargo bench -p chroma-index --bench quantized_spann -- --dataset wikipedia-en --checkpoint 5 --threads 16 --data-bits 4 --centroid-bits 4
+1bit: cargo bench -p chroma-index --bench quantized_spann -- --dataset wikipedia-en --checkpoint 10 --threads 16 --data-bits 1 --centroid-bits 1
+
+=== Cluster Statistics ===
+|Quant | CP | Centroids |   Min |   Max | Median |   P90 |   P99 |    Avg |    Std |
+|------|----|-----------|-------|-------|--------|-------|-------|--------|--------|
+| 4bit |  5 |     27.6K |     0 |   512 |    390 |   489 |   511 |  372.3 |  102.1 |
+| 1bit |  5 |     27.7K |     0 |   512 |    387 |   489 |   511 |  370.6 |  101.8 |
+
+=== Task Counts ===
+|Quant | CP |      add | navigate | register |    spawn |    scrub |    split |    merge | reassign |     drop |     load | load_raw | quantize |   search |
+|------|----|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|
+| 4bit |  5 |    1.00M |    2.94M |    2.11M |    11.0K |   190.8K |     5.5K |       28 |    1.94M |     5.6K |   190.8K |    11.0K |    7.01M |        0 |
+| 1bit |  5 |    1.00M |    3.05M |    2.08M |    11.0K |   190.3K |     5.6K |       28 |    2.05M |     5.6K |   190.3K |    11.1K |    6.94M |        0 |
+
+=== Task Total Time ===
+|Quant | CP |      add | navigate | register |    spawn |    scrub |    split |    merge | reassign |     drop |     load | load_raw | quantize |   search | raw_pts |  raw/pt |
+|------|----|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|---------|---------|
+| 4bit |  5 | 2583.79s | 1309.61s |  304.06s |   63.41s |   21.22s | 2218.35s |    3.61s | 1442.55s |  269.02s |    4.43s |  381.57s |  472.92s |      0ns |   2.28M | 167.2µs |
+| 1bit |  5 | 2046.80s | 1270.90s |   14.06s |   22.49s |   17.65s | 1779.57s |    1.89s | 1214.73s |  272.04s |    1.77s |  396.20s |   15.68s |      0ns |   2.31M | 171.2µs |
+
+=== Task Avg Time ===
+|Quant | CP |      add | navigate | register |    spawn |    scrub |    split |    merge | reassign |     drop |     load | load_raw | quantize |   search |
+|------|----|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|
+| 4bit |  5 |   2.58ms |  444.7µs |  143.9µs |   5.77ms |  111.2µs | 401.29ms | 128.89ms |  742.0µs |  48.42ms |   23.2µs |  34.62ms |   67.4µs |        - |
+| 1bit |  5 |   2.05ms |  416.2µs |    6.8µs |   2.04ms |   92.8µs | 320.12ms |  67.53ms |  591.5µs |  48.69ms |    9.3µs |  35.84ms |    2.3µs |        - |
+
+
+=== Indexing Summary ===
+Total vectors: 5.00M
+Total time: 14.3m
+Overall throughput: 5814 vec/s
+
+=== Recall Summary ===
+|  CP |  Vectors |    Index |   Commit | Queries |      nprobe=16      |      nprobe=32      |      nprobe=64      |     nprobe=128      |     nprobe=256      |
+|Quant |     |          |          |          |         |  R@10 R@100    Lat |  R@10 R@100    Lat |  R@10 R@100    Lat |  R@10 R@100    Lat |  R@10 R@100    Lat |
+|------|-----|----------|----------|----------|---------|---------------------|---------------------|---------------------|---------------------|---------------------|
+| 4bit |   5 |    5.00M |     3.0m |   14.76s |     100 |  0.77  0.72   20ms |  0.84  0.80   21ms |  0.88  0.86   33ms |  0.90  0.89   51ms |  0.93  0.91   85ms |
+| 1bit |   5 |    5.00M |     2.3m |    7.47s |     100 |  0.75  0.62   12ms |  0.81  0.68   12ms |  0.87  0.72   20ms |  0.91  0.75   36ms |  0.93  0.76   67ms |
+
+
+
+### Navigate() using quantized centroids
+
+Overall 1.8x speedup: 10597 vec/s vs 5814 vec/s
+- Top items:
   - 41% faster adds (1.22ms vs 2.05ms),
   - 41% faster split (219.72ms vs 320.12ms),
   - 22% faster merge (55.50ms vs 67.53ms)
+
 === Task Avg Time ===
 |  nav| CP |      add | navigate | register |    spawn |    scrub |    split |    merge | reassign |     drop |     load | load_raw | quantize |   search |  raw_add |   raw_rm |    q_add |     q_rm |
 |-----|----|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|
 |quant|  5 |   1.23ms |  122.1µs |    5.2µs |   1.79ms |   77.3µs | 219.72ms |  55.50ms |  221.0µs |  42.59ms |    8.3µs |  37.08ms |    1.9µs |        - |   1.22ms |  114.4µs |  572.5µs |  379.6µs |
 | full|  5 |   2.05ms |  416.2µs |    6.8µs |   2.04ms |   92.8µs | 320.12ms |  67.53ms |  591.5µs |  48.69ms |    9.3µs |  35.84ms |    2.3µs |        - |
 
-## Recall
+### Recall
 
-### Navigate using quantized centroids
+-1-4% (decreasing with nprobe)
 
-- recall: -1-4% (decreasing with nprobe)
 === Recall Summary ===
 |  nav|  CP |  Vectors |    Index |   Commit | Queries |      nprobe=16      |      nprobe=32      |      nprobe=64      |     nprobe=128      |     nprobe=256      |
 |     |     |          |          |          |         |  R@10  R@100    Lat |  R@10  R@100    Lat |  R@10  R@100    Lat |  R@10  R@100    Lat |  R@10  R@100    Lat |

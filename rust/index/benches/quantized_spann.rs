@@ -599,7 +599,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         // Capture stats snapshot before commit consumes the index
         let cluster_sizes = index.cluster_sizes();
-        batch_snapshots.push(index.stats().snapshot(&cluster_sizes));
+        let mut snap = index.stats().snapshot(&cluster_sizes);
 
         let flusher = index
             .commit(&blockfile_provider, &usearch_provider)
@@ -607,6 +607,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .expect("Failed to commit");
         file_ids = Some(flusher.flush().await.expect("Failed to flush"));
         let commit_time = commit_start.elapsed();
+
+        let checkpoint_wall = load_time + raw_write_time + index_time + commit_time;
+        snap.wall_nanos = checkpoint_wall.as_nanos() as u64;
+        batch_snapshots.push(snap);
 
         total_vectors += actual_count;
 
