@@ -286,7 +286,7 @@ impl VectorIndex for USearchIndex {
         }
 
         if let Some(ref code) = code {
-            let i8_slice = bytemuck::cast_slice::<u8, i8>(code.as_ref());
+            let i8_slice = bytemuck::cast_slice::<u8, i8>(code.as_slice());
             index.add(key as u64, i8_slice)
         } else {
             index.add(key as u64, vector)
@@ -346,7 +346,7 @@ impl VectorIndex for USearchIndex {
                 1 => Code::<1>::quantize(query, center).into_inner(),
                 _ => Code::<4>::quantize(query, center).into_inner(),
             };
-            let i8_slice = bytemuck::cast_slice::<u8, i8>(code.as_ref());
+            let i8_slice = bytemuck::cast_slice::<u8, i8>(code.as_slice());
             self.index.read().search(i8_slice, count)
         } else {
             self.index.read().search(query, count)

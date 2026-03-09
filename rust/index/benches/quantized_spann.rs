@@ -122,9 +122,9 @@ fn spann_config(data_bits: u8, centroid_bits: Option<u8>) -> SpannIndexConfig {
         write_rng_factor: Some(4.0),
 
         // Cluster maintenance
-        split_threshold: Some(512),
-        merge_threshold: Some(128),
-        reassign_neighbor_count: Some(32),
+        split_threshold: Some(8),
+        merge_threshold: Some(4),
+        reassign_neighbor_count: Some(2),
 
         // Commit-time parameters
         center_drift_threshold: Some(0.125),
