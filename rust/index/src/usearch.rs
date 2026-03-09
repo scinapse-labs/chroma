@@ -529,6 +529,7 @@ mod tests {
             expansion_add: 128,
             expansion_search: 64,
             quantization_center: Some(center),
+            centroid_quantization_bits: 4,
         };
 
         // Generate test vectors
@@ -591,6 +592,7 @@ mod tests {
             expansion_add: 128,
             expansion_search: 64,
             quantization_center: None,
+            centroid_quantization_bits: 4,
         };
 
         // Generate all test vectors upfront
@@ -683,6 +685,7 @@ mod tests {
             expansion_add: 128,
             expansion_search: 64,
             quantization_center: None,
+            centroid_quantization_bits: 4,
         };
 
         // Generate 128 random vectors

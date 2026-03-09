@@ -5,12 +5,12 @@ BATCH=512 for quantize/distance_code, SCAN_N=2048 for scan).
 Throughput for quantize benchmarks counts both input arrays (embedding + centroid =
 `2 * dim * 4` bytes per call).
 
-| Benchmark | What it measures | 4-bit | 1-bit | Speedup |
-|-----------|------------------|-------|-------|---------|
-| quantize/quant-4bit/1024 vs quantize/quant-1bit/1024 | Data vector quantization | 28 ms, 144 MiB/s | 365–390 µs, 9.9–10.1 GiB/s | ~71x faster |
-| distance_code/dc-4bit/1024 vs distance_code/dc-1bit/1024 | Code-vs-code distance: 256 pairs | 174 µs, 1.43 GiB/s | 2.45 µs, 28 GiB/s | ~71x faster |
-| distance_query/dq-4f/scan vs distance_query/dq-bw/scan | Batched distance query: 2048 codes, 1 hot query | 1.01 ms, 965–1012 MiB/s | 39 µs, 6.5–6.9 GiB/s | ~25x faster |
-| primitives/quant-query/full/1024 | QuantizedQuery::new alone | N/A | 568 ns, 6.73 GiB/s | — |
+|Function| Benchmark | 4-bit | 1-bit | Speedup |
+|--------|-----------|-------|-------|---------|
+|quantize data| quantize/quant-4bit/1024 vs quantize/quant-1bit/1024 | 28 ms, 144 MiB/s | 365–390 µs, 10.1 GiB/s | ~71x faster |
+|distance_code| distance_code/dc-4bit/1024 vs distance_code/dc-1bit/1024 | 174 µs, 1.43 GiB/s | 2.45 µs, 28 GiB/s | ~71x faster |
+|distance_query| distance_query/dq-4f/scan vs distance_query/dq-bw/scan |  1.01 ms, 965–1012 MiB/s | 39 µs, 6.9 GiB/s | ~25x faster |
+|quantize query| primitives/quant-query/full/1024 | N/A | 568 ns, 6.73 GiB/s | — |
 
 The batch `quant-query` includes residual allocation, `c_dot_q`, `q_norm`, and cache-cold
 effects from cycling 512 distinct queries (~2.55 us/query). `quant-query/full` isolates
@@ -145,6 +145,8 @@ the code-size advantage of 1-bit vs 4-bit without the query build overhead.
 
 # Recall at 1M Vectors
 
+## Single Centroid Recall
+
 Benchmark data from `cargo bench -p chroma-index --bench quantization_recall -- --dataset <dataset> --size 1000000` (K=10) and `--k 100` (K=100).
 Full output in `recall_1M_results.txt` and `recall_1M_results_k100.txt`.
 Run on r6i.8xlarge (16 physical cores, Intel Ice Lake).
@@ -211,11 +213,7 @@ addresses centroid-level recall in a multi-cluster IVF setting.
 
 ---
 
-# Centroid Recall (IVF)
-
-Benchmark data from `cargo bench -p chroma-index --bench quantization_recall_ivf -- --size 1000000`
-(cohere_wiki, N=1M, 1000 clusters via KMeans, K=10, 1-bit data, 1-bit centroids,
-r6i.8xlarge). Full raw output in `saved_benchmarks/recall_ivf_r6i.8xlarge.txt`.
+## Synthetic SPANN / Centroid Recall
 
 This measures centroid selection recall: what fraction of the true top-K neighbors
 reside in the probed clusters. Centroids are quantized with 1-bit RaBitQ relative to a
@@ -243,6 +241,10 @@ exact centroid distance (no quantization) -- the maximum recall achievable at th
 | 128 | 2x | 0.950 | 0.953 |
 | 128 | 4x | 0.953 | 0.953 |
 
+Benchmark data from `cargo bench -p chroma-index --bench quantization_recall_ivf -- --size 1000000`
+(cohere_wiki, N=1M, 1000 clusters via KMeans, K=10, 1-bit data, 1-bit centroids,
+r6i.8xlarge). Full raw output in `saved_benchmarks/recall_ivf_r6i.8xlarge.txt`.
+
 **Findings:** Centroid quantization error is small. At every nprobe, `centroid_rerank=2x`
 is sufficient to close the gap between quantized and exact centroid recall completely
 (and sometimes slightly exceeds the ceiling due to randomness in the quantized ranking).
@@ -261,12 +263,7 @@ centroid recall while saving the memory cost of storing raw centroids.
 
 ---
 
-# Quantized KMeans Clustering
-
-Benchmark data from `cargo bench -p chroma-index --bench quantization_recall_ivf -- --size 1000000`
-with `--cluster-bits 1`, `--cluster-bits 4`, and no flag (exact).
-(cohere_wiki, N=1M, 1000 clusters, K=10, 1-bit data, 1-bit centroids, r6i.8xlarge).
-Full raw output in `saved_benchmarks/recall_ivf_1M_quantized_clustering_k10.txt`.
+## Quantized KMeans Clustering Recall
 
 This measures how much end-to-end recall degrades when KMeans uses quantized
 code-vs-code distances instead of exact f32 distances for cluster assignment.
@@ -290,6 +287,10 @@ Centroid computation still uses raw f32 vectors; only the vector assignment step
 | 64 | 0.913 | 0.927 | 0.912 |
 | 128 | 0.950 | 0.972 | 0.948 |
 
+Benchmark data from `cargo bench -p chroma-index --bench quantization_recall_ivf -- --size 1000000`
+with `--cluster-bits 1`, `--cluster-bits 4`, and no flag (exact).
+(cohere_wiki, N=1M, 1000 clusters, K=10, 1-bit data, 1-bit centroids, r6i.8xlarge).
+Full raw output in `saved_benchmarks/recall_ivf_1M_quantized_clustering_k10.txt`.
 
 **Findings:** At 1M vectors, quantized KMeans produces clusters of comparable quality
 to exact KMeans. 1-bit KMeans shows a modest degradation of up to 0.9% end-to-end

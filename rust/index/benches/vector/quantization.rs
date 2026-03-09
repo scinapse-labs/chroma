@@ -519,6 +519,23 @@ fn bench_distance_query(c: &mut Criterion) {
             });
         });
 
+        group.throughput(Throughput::Bytes(
+            (SCAN_N / 2) as u64 * 2 * Code::<1>::size(SCAN_DIM) as u64,
+        ));
+        desc!(
+            "dc-1bit/scan",
+            format!("hot {} pairs @ dim={SCAN_DIM}; simsimd hamming code-vs-code", SCAN_N / 2)
+        );
+        group.bench_function("dc-1bit/scan", |b| {
+            b.iter(|| {
+                for pair in codes_1.chunks_exact(2) {
+                    let a = Code::<1, _>::new(pair[0].as_slice());
+                    let bb = Code::<1, _>::new(pair[1].as_slice());
+                    black_box(a.distance_code(&bb, &df, cn, SCAN_DIM));
+                }
+            });
+        });
+
         group.throughput(Throughput::Bytes(tput_1bit));
         desc!(
             "dq-bw/scan",
