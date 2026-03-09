@@ -388,7 +388,7 @@ impl Scheduler {
         filtered_collections
     }
 
-    pub(crate) fn schedule_internal(&mut self, collection_records: Vec<CollectionRecord>) {
+    pub(crate) async fn schedule_internal(&mut self, collection_records: Vec<CollectionRecord>) {
         self.job_queue.clear();
         let mut oneoff_collections = Vec::with_capacity(collection_records.len());
         let mut regular_collections = Vec::with_capacity(collection_records.len());
@@ -602,7 +602,7 @@ impl Scheduler {
         let collection_records = self
             .verify_and_enrich_collections(filtered_collections)
             .await;
-        self.schedule_internal(collection_records);
+        self.schedule_internal(collection_records).await;
     }
 
     pub(crate) fn get_jobs(&self) -> impl Iterator<Item = &CompactionJob> {
