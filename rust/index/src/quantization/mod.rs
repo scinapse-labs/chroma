@@ -92,6 +92,12 @@ use chroma_distance::DistanceFunction;
 
 pub struct Code<const BITS: u8, T = Vec<u8>>(T);
 
+impl<const BITS: u8, T> Code<BITS, T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
 impl<const BITS: u8, T: AsRef<[u8]>> AsRef<[u8]> for Code<BITS, T> {
     fn as_ref(&self) -> &[u8] {
         self.0.as_ref()

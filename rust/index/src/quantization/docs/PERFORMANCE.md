@@ -7,17 +7,15 @@ Throughput for quantize benchmarks counts both input arrays (embedding + centroi
 
 |Function| Benchmark | 4-bit | 1-bit | Speedup |
 |--------|-----------|-------|-------|---------|
-|quantize data| quantize/quant-4bit/1024 vs quantize/quant-1bit/1024 | 28 ms, 144 MiB/s | 365–390 µs, 10.1 GiB/s | ~71x faster |
-|distance_code| distance_code/dc-4bit/1024 vs distance_code/dc-1bit/1024 | 174 µs, 1.43 GiB/s | 2.45 µs, 28 GiB/s | ~71x faster |
-|distance_query| distance_query/dq-4f/scan vs distance_query/dq-bw/scan |  1.01 ms, 965–1012 MiB/s | 39 µs, 6.9 GiB/s | ~25x faster |
+|quantize data| quantize/quant-4bit/1024 vs quantize/quant-1bit/1024 | 28 ms, 144 MiB/s | 365–390 µs, 10.1 GiB/s | ~71x |
+|distance_code| distance_code/dc-4bit/1024 vs distance_code/dc-1bit/1024 | 174 µs, 1.43 GiB/s | 2.45 µs, 28 GiB/s | ~71x |
+|distance_query| distance_query/dq-4f/scan vs distance_query/dq-bw/scan |  1.01 ms, 965–1012 MiB/s | 39 µs, 6.9 GiB/s | ~25x |
 |quantize query| primitives/quant-query/full/1024 | N/A | 568 ns, 6.73 GiB/s | — |
 
 The batch `quant-query` includes residual allocation, `c_dot_q`, `q_norm`, and cache-cold
 effects from cycling 512 distinct queries (~2.55 us/query). `quant-query/full` isolates
 `QuantizedQuery::new` with a single hot-cache vector (568 ns). The 4.5x per-query gap
 is the cost of the preparation pipeline and cache pressure, not the quantization itself.
-
-**Summary:** 1-bit RaBitQ is 25--71x faster than 4-bit across data quantization, code-vs-code distance, and batched query distance. The 1-bit path uses sign-bit packing with dual-accumulator fused reductions, simsimd hamming/AND+popcount, and QuantizedQuery bit-planes (fused quantize+scatter via `chunks_exact(8)`); the 4-bit path uses ray-walk codes, nibble unpack, and f32 dot products.
 
 ## vs Exact f32 Distance
 
@@ -297,6 +295,55 @@ to exact KMeans. 1-bit KMeans shows a modest degradation of up to 0.9% end-to-en
 recall (0.931 vs 0.922 at nprobe=128), with smaller differences at lower nprobes.
 4-bit KMeans slightly outperforms exact in this run (+0.6--1.6%), likely due to KMeans
 converging to a different (better) local optimum rather than a systematic advantage.
+
+
+
+# Central Index Performance
+
+## USearch Parallelism
+
+### Our global lock
+We have a global read/write lock on the USearch index. Without it we get a 1.3x speedup in throughput.
+
+|lock?| CP |      add | navigate | register |    spawn |    scrub |    split |    merge | reassign |     drop |     load | load_raw | quantize |   search |  raw_add |   raw_rm |    q_add |     q_rm |
+|-----|----|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|
+|  yes|  5 |   2.05ms |  416.2µs |    6.8µs |   2.04ms |   92.8µs | 320.12ms |  67.53ms |  591.5µs |  48.69ms |    9.3µs |  35.84ms |    2.3µs |        - | | | | |
+|  no |  5 |   1.85ms |  370.2µs |    6.6µs |   1.55ms |   95.3µs | 292.97ms |  52.95ms |  528.5µs |  46.76ms |    9.5µs |  34.75ms |    2.2µs |        - |  980.2µs |    7.8µs |  563.5µs |    7.5µs |
+
+overall throughput: 7476 vec/s vs 5800 vec/s (1.3x speedup) mostly due to faster split (-30ms) and merge (-15ms)
+
+cargo bench -p chroma-index --bench quantized_spann -- --dataset wikipedia-en --checkpoint 1 --threads 16 --data-bits 1 --centroid-bits 1
+
+### Usearch global lock
+
+Usearch also has a global lock internally. If we chose to fork Usearch and make this lock more granular, we could see an additional speedup.
+
+## Indexing Performance
+
+### Navigate using quantized centroids
+
+- speedup
+  - 41% faster adds (1.22ms vs 2.05ms),
+  - 41% faster split (219.72ms vs 320.12ms),
+  - 22% faster merge (55.50ms vs 67.53ms)
+=== Task Avg Time ===
+|  nav| CP |      add | navigate | register |    spawn |    scrub |    split |    merge | reassign |     drop |     load | load_raw | quantize |   search |  raw_add |   raw_rm |    q_add |     q_rm |
+|-----|----|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|
+|quant|  5 |   1.23ms |  122.1µs |    5.2µs |   1.79ms |   77.3µs | 219.72ms |  55.50ms |  221.0µs |  42.59ms |    8.3µs |  37.08ms |    1.9µs |        - |   1.22ms |  114.4µs |  572.5µs |  379.6µs |
+| full|  5 |   2.05ms |  416.2µs |    6.8µs |   2.04ms |   92.8µs | 320.12ms |  67.53ms |  591.5µs |  48.69ms |    9.3µs |  35.84ms |    2.3µs |        - |
+
+## Recall
+
+### Navigate using quantized centroids
+
+- recall: -1-4% (decreasing with nprobe)
+=== Recall Summary ===
+|  nav|  CP |  Vectors |    Index |   Commit | Queries |      nprobe=16      |      nprobe=32      |      nprobe=64      |     nprobe=128      |     nprobe=256      |
+|     |     |          |          |          |         |  R@10  R@100    Lat |  R@10  R@100    Lat |  R@10  R@100    Lat |  R@10  R@100    Lat |  R@10  R@100    Lat |
+|-----|-----|----------|----------|----------|---------|---------------------|---------------------|---------------------|---------------------|---------------------|
+|quant|   5 |    5.00M |     1.4m |    7.46s |     100 |  0.72  0.62   12ms  |  0.80  0.69   12ms  |  0.85  0.73   20ms  |  0.88  0.75   34ms  |  0.92  0.77   64ms  |
+|full |   5 |    5.00M |     2.3m |    7.47s |     100 |  0.75  0.62   12ms  |  0.81  0.68   12ms  |  0.87  0.72   20ms  |  0.91  0.75   36ms  |  0.93  0.76   67ms  |
+
 
 
 ---
